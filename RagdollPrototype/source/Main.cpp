@@ -142,12 +142,6 @@ namespace ragdoll_debug {
         );
     }
 
-    static void RotatePointAroundPivotRad(CVector& point, const CVector& pivot, const CVector& axis, float angleRad) {
-        const CVector rel = VecSub(point, pivot);
-        const CVector rotated = RotateVectorAroundAxisRad(rel, axis, angleRad);
-        point = VecAdd(pivot, rotated);
-    }
-
     static void RotateMatrixBasisAroundAxisRad(RwMatrix* m, const CVector& axis, float angleRad) {
         CVector right = GetMatrixRight(m);
         CVector up = GetMatrixUp(m);
@@ -194,40 +188,131 @@ namespace ragdoll_debug {
         return &matrixArray[index];
     }
 
-    static void RotateLimbChainRigid(
-        RwMatrix* joint,
-        RwMatrix* child,
-        RwMatrix* next,
-        RwMatrix* end,
-        const CVector& axis,
-        float angleRad)
+    static void RotateBoneSoChildPointsTo(
+        RwMatrix* bone,
+        const CVector& currentChildDirRaw,
+        const CVector& desiredChildDirRaw,
+        const CVector& fallbackAxisRaw)
     {
-        if (!joint || !child || !next || !end)
+        if (!bone)
             return;
 
-        CVector jointPos = GetMatrixPos(joint);
-        CVector childPos = GetMatrixPos(child);
-        CVector nextPos = GetMatrixPos(next);
-        CVector endPos = GetMatrixPos(end);
+        const CVector currentDir = SafeNormalise(currentChildDirRaw, CVector(0.0f, 1.0f, 0.0f));
+        const CVector desiredDir = SafeNormalise(desiredChildDirRaw, currentDir);
 
-        RotateMatrixBasisAroundAxisRad(joint, axis, angleRad);
-        RotateMatrixBasisAroundAxisRad(child, axis, angleRad);
-        RotateMatrixBasisAroundAxisRad(next, axis, angleRad);
-        RotateMatrixBasisAroundAxisRad(end, axis, angleRad);
+        float dot = ClampUnit(VecDot(currentDir, desiredDir));
+        float angleRad = std::acos(dot);
 
-        RotatePointAroundPivotRad(childPos, jointPos, axis, angleRad);
-        RotatePointAroundPivotRad(nextPos, jointPos, axis, angleRad);
-        RotatePointAroundPivotRad(endPos, jointPos, axis, angleRad);
+        CVector axis = VecCross(currentDir, desiredDir);
 
-        SetMatrixPos(joint, jointPos);
-        SetMatrixPos(child, childPos);
-        SetMatrixPos(next, nextPos);
-        SetMatrixPos(end, endPos);
+        if (VecLenSq(axis) <= 0.000001f) {
+            axis = fallbackAxisRaw;
 
-        RwMatrixUpdate(joint);
-        RwMatrixUpdate(child);
-        RwMatrixUpdate(next);
-        RwMatrixUpdate(end);
+            if (dot > 0.9999f)
+                angleRad = 0.0f;
+            else
+                angleRad = 3.14159265358979323846f;
+        }
+
+        axis = SafeNormalise(axis, fallbackAxisRaw);
+        RotateMatrixBasisAroundAxisRad(bone, axis, angleRad);
+    }
+
+    static void SolveLinearChain5(
+        RwMatrix* a,
+        RwMatrix* b,
+        RwMatrix* c,
+        RwMatrix* d,
+        RwMatrix* e,
+        const CVector& desiredDirRaw,
+        const CVector& fallbackAxisRaw)
+    {
+        if (!a || !b || !c || !d || !e)
+            return;
+
+        const CVector aPos = GetMatrixPos(a);
+        const CVector bPos = GetMatrixPos(b);
+        const CVector cPos = GetMatrixPos(c);
+        const CVector dPos = GetMatrixPos(d);
+        const CVector ePos = GetMatrixPos(e);
+
+        const float abLen = VecLen(VecSub(bPos, aPos));
+        const float bcLen = VecLen(VecSub(cPos, bPos));
+        const float cdLen = VecLen(VecSub(dPos, cPos));
+        const float deLen = VecLen(VecSub(ePos, dPos));
+
+        if (abLen <= 0.0001f || bcLen <= 0.0001f || cdLen <= 0.0001f || deLen <= 0.0001f)
+            return;
+
+        const CVector desiredDir = SafeNormalise(desiredDirRaw, CVector(0.0f, 0.0f, 1.0f));
+
+        RotateBoneSoChildPointsTo(a, VecSub(bPos, aPos), desiredDir, fallbackAxisRaw);
+        RotateBoneSoChildPointsTo(b, VecSub(cPos, bPos), desiredDir, fallbackAxisRaw);
+        RotateBoneSoChildPointsTo(c, VecSub(dPos, cPos), desiredDir, fallbackAxisRaw);
+        RotateBoneSoChildPointsTo(d, VecSub(ePos, dPos), desiredDir, fallbackAxisRaw);
+        RotateBoneSoChildPointsTo(e, VecSub(ePos, dPos), desiredDir, fallbackAxisRaw);
+
+        const CVector newB = VecAdd(aPos, VecScale(desiredDir, abLen));
+        const CVector newC = VecAdd(newB, VecScale(desiredDir, bcLen));
+        const CVector newD = VecAdd(newC, VecScale(desiredDir, cdLen));
+        const CVector newE = VecAdd(newD, VecScale(desiredDir, deLen));
+
+        SetMatrixPos(a, aPos);
+        SetMatrixPos(b, newB);
+        SetMatrixPos(c, newC);
+        SetMatrixPos(d, newD);
+        SetMatrixPos(e, newE);
+
+        RwMatrixUpdate(a);
+        RwMatrixUpdate(b);
+        RwMatrixUpdate(c);
+        RwMatrixUpdate(d);
+        RwMatrixUpdate(e);
+    }
+
+    static void SolveLinearChain4(
+        RwMatrix* a,
+        RwMatrix* b,
+        RwMatrix* c,
+        RwMatrix* d,
+        const CVector& desiredDirRaw,
+        const CVector& fallbackAxisRaw)
+    {
+        if (!a || !b || !c || !d)
+            return;
+
+        const CVector aPos = GetMatrixPos(a);
+        const CVector bPos = GetMatrixPos(b);
+        const CVector cPos = GetMatrixPos(c);
+        const CVector dPos = GetMatrixPos(d);
+
+        const float abLen = VecLen(VecSub(bPos, aPos));
+        const float bcLen = VecLen(VecSub(cPos, bPos));
+        const float cdLen = VecLen(VecSub(dPos, cPos));
+
+        if (abLen <= 0.0001f || bcLen <= 0.0001f || cdLen <= 0.0001f)
+            return;
+
+        const CVector desiredDir = SafeNormalise(desiredDirRaw, CVector(1.0f, 0.0f, 0.0f));
+
+        RotateBoneSoChildPointsTo(a, VecSub(bPos, aPos), desiredDir, fallbackAxisRaw);
+        RotateBoneSoChildPointsTo(b, VecSub(cPos, bPos), desiredDir, fallbackAxisRaw);
+        RotateBoneSoChildPointsTo(c, VecSub(dPos, cPos), desiredDir, fallbackAxisRaw);
+        RotateBoneSoChildPointsTo(d, VecSub(dPos, cPos), desiredDir, fallbackAxisRaw);
+
+        const CVector newB = VecAdd(aPos, VecScale(desiredDir, abLen));
+        const CVector newC = VecAdd(newB, VecScale(desiredDir, bcLen));
+        const CVector newD = VecAdd(newC, VecScale(desiredDir, cdLen));
+
+        SetMatrixPos(a, aPos);
+        SetMatrixPos(b, newB);
+        SetMatrixPos(c, newC);
+        SetMatrixPos(d, newD);
+
+        RwMatrixUpdate(a);
+        RwMatrixUpdate(b);
+        RwMatrixUpdate(c);
+        RwMatrixUpdate(d);
     }
 
     static CVector BuildArmSideTarget(
@@ -282,46 +367,6 @@ namespace ragdoll_debug {
         return SafeNormalise(target, legDown);
     }
 
-    static void ApplyLimbTPoseDirect(
-        RwMatrix* joint,
-        RwMatrix* child,
-        RwMatrix* next,
-        RwMatrix* end,
-        const CVector& desiredDirRaw,
-        const CVector& fallbackAxisRaw)
-    {
-        if (!joint || !child || !next || !end)
-            return;
-
-        const CVector jointPos = GetMatrixPos(joint);
-        const CVector childPos = GetMatrixPos(child);
-        const CVector upperVec = VecSub(childPos, jointPos);
-
-        if (VecLenSq(upperVec) <= 0.000001f)
-            return;
-
-        const CVector currentDir = SafeNormalise(upperVec, CVector(0.0f, -1.0f, 0.0f));
-        const CVector desiredDir = SafeNormalise(desiredDirRaw, CVector(0.0f, -1.0f, 0.0f));
-
-        float dot = ClampUnit(VecDot(currentDir, desiredDir));
-        float angleRad = std::acos(dot); // radians
-
-        CVector axis = VecCross(currentDir, desiredDir);
-
-        if (VecLenSq(axis) <= 0.000001f) {
-            axis = fallbackAxisRaw;
-
-            if (dot > 0.9999f)
-                angleRad = 0.0f;
-            else
-                angleRad = 3.14159265358979323846f;
-        }
-
-        axis = SafeNormalise(axis, fallbackAxisRaw);
-
-        RotateLimbChainRigid(joint, child, next, end, axis, angleRad);
-    }
-
     static void ApplyPlayerTPose(CPed* ped, RpHAnimHierarchy* hierarchy) {
         if (!ped || !hierarchy)
             return;
@@ -329,9 +374,14 @@ namespace ragdoll_debug {
         if (ped != FindPlayerPed())
             return;
 
-        RwMatrix* torso = GetBoneMatrixById(hierarchy, BONE_UPPERTORSO);
+        // Center chain
         RwMatrix* pelvis = GetBoneMatrixById(hierarchy, BONE_PELVIS);
+        RwMatrix* spine1 = GetBoneMatrixById(hierarchy, BONE_SPINE1);
+        RwMatrix* torso = GetBoneMatrixById(hierarchy, BONE_UPPERTORSO);
+        RwMatrix* neck = GetBoneMatrixById(hierarchy, BONE_NECK);
+        RwMatrix* head = GetBoneMatrixById(hierarchy, BONE_HEAD);
 
+        // Arms
         RwMatrix* lShoulder = GetBoneMatrixById(hierarchy, BONE_LEFTSHOULDER);
         RwMatrix* lElbow = GetBoneMatrixById(hierarchy, BONE_LEFTELBOW);
         RwMatrix* lWrist = GetBoneMatrixById(hierarchy, BONE_LEFTWRIST);
@@ -342,6 +392,7 @@ namespace ragdoll_debug {
         RwMatrix* rWrist = GetBoneMatrixById(hierarchy, BONE_RIGHTWRIST);
         RwMatrix* rHand = GetBoneMatrixById(hierarchy, BONE_RIGHTHAND);
 
+        // Legs
         RwMatrix* lHip = GetBoneMatrixById(hierarchy, BONE_LEFTHIP);
         RwMatrix* lKnee = GetBoneMatrixById(hierarchy, BONE_LEFTKNEE);
         RwMatrix* lAnkle = GetBoneMatrixById(hierarchy, BONE_LEFTANKLE);
@@ -352,7 +403,7 @@ namespace ragdoll_debug {
         RwMatrix* rAnkle = GetBoneMatrixById(hierarchy, BONE_RIGHTANKLE);
         RwMatrix* rFoot = GetBoneMatrixById(hierarchy, BONE_RIGHTFOOT);
 
-        if (!torso || !pelvis)
+        if (!pelvis || !spine1 || !torso || !neck || !head)
             return;
 
         if (!lShoulder || !lElbow || !lWrist || !lHand)
@@ -365,40 +416,69 @@ namespace ragdoll_debug {
         if (!rHip || !rKnee || !rAnkle || !rFoot)
             return;
 
-        const CVector torsoPos = GetMatrixPos(torso);
         const CVector pelvisPos = GetMatrixPos(pelvis);
+        const CVector spinePos = GetMatrixPos(spine1);
+        const CVector torsoPos = GetMatrixPos(torso);
+        const CVector neckPos = GetMatrixPos(neck);
+        const CVector headPos = GetMatrixPos(head);
 
-        const CVector torsoUp = SafeNormalise(GetMatrixUp(torso), CVector(0.0f, 0.0f, 1.0f));
-        const CVector torsoAt = SafeNormalise(GetMatrixAt(torso), CVector(0.0f, 1.0f, 0.0f));
+        // Build a stable "up" from the current center chain itself.
+        const CVector chainUp = SafeNormalise(
+            VecAdd(
+                VecAdd(
+                    SafeNormalise(VecSub(spinePos, pelvisPos), CVector(0.0f, 0.0f, 1.0f)),
+                    SafeNormalise(VecSub(torsoPos, spinePos), CVector(0.0f, 0.0f, 1.0f))
+                ),
+                VecAdd(
+                    SafeNormalise(VecSub(neckPos, torsoPos), CVector(0.0f, 0.0f, 1.0f)),
+                    SafeNormalise(VecSub(headPos, neckPos), CVector(0.0f, 0.0f, 1.0f))
+                )
+            ),
+            CVector(0.0f, 0.0f, 1.0f)
+        );
 
-        // Arms: same working solve as before.
+        CVector forwardHint = SafeNormalise(GetMatrixAt(torso), CVector(0.0f, 1.0f, 0.0f));
+        forwardHint = SafeNormalise(ProjectOntoPlane(forwardHint, chainUp), CVector(0.0f, 1.0f, 0.0f));
+        const CVector rightHint = SafeNormalise(VecCross(forwardHint, chainUp), CVector(1.0f, 0.0f, 0.0f));
+
+        // Center chain solved the same way.
+        SolveLinearChain5(
+            pelvis, spine1, torso, neck, head,
+            chainUp,
+            forwardHint
+        );
+
+        const CVector torsoPos2 = GetMatrixPos(torso);
+        const CVector pelvisPos2 = GetMatrixPos(pelvis);
+
+        // Arms solved the same way.
         const CVector lArmSide = BuildArmSideTarget(
-            torsoPos,
+            torsoPos2,
             GetMatrixPos(lShoulder),
-            torsoUp,
-            CVector(-1.0f, 0.0f, 0.0f)
+            chainUp,
+            VecScale(rightHint, -1.0f)
         );
 
         const CVector rArmSide = BuildArmSideTarget(
-            torsoPos,
+            torsoPos2,
             GetMatrixPos(rShoulder),
-            torsoUp,
-            CVector(1.0f, 0.0f, 0.0f)
+            chainUp,
+            rightHint
         );
 
-        ApplyLimbTPoseDirect(
+        SolveLinearChain4(
             lShoulder, lElbow, lWrist, lHand,
             lArmSide,
-            torsoAt
+            forwardHint
         );
 
-        ApplyLimbTPoseDirect(
+        SolveLinearChain4(
             rShoulder, rElbow, rWrist, rHand,
             rArmSide,
-            torsoAt
+            forwardHint
         );
 
-        // Legs: derive "down" from the current upper-leg directions instead of torso axes.
+        // Legs solved the same way.
         const CVector lHipPos = GetMatrixPos(lHip);
         const CVector lKneePos = GetMatrixPos(lKnee);
         const CVector rHipPos = GetMatrixPos(rHip);
@@ -407,37 +487,36 @@ namespace ragdoll_debug {
         const CVector stableLegDown = BuildStableLegDown(
             lHipPos, lKneePos,
             rHipPos, rKneePos,
-            VecScale(torsoUp, -1.0f)
+            VecScale(chainUp, -1.0f)
         );
 
         const CVector lLegSide = BuildLegSideTarget(
-            pelvisPos,
+            pelvisPos2,
             lHipPos,
             stableLegDown,
-            CVector(-1.0f, 0.0f, 0.0f)
+            VecScale(rightHint, -1.0f)
         );
 
         const CVector rLegSide = BuildLegSideTarget(
-            pelvisPos,
+            pelvisPos2,
             rHipPos,
             stableLegDown,
-            CVector(1.0f, 0.0f, 0.0f)
+            rightHint
         );
 
-        // Small spread only. Bigger values start turning the legs into a split.
-        const CVector lLegDir = BuildLegTargetDir(stableLegDown, lLegSide, 0.08f);
-        const CVector rLegDir = BuildLegTargetDir(stableLegDown, rLegSide, 0.08f);
+        const CVector lLegDir = BuildLegTargetDir(stableLegDown, lLegSide, 0.04f);
+        const CVector rLegDir = BuildLegTargetDir(stableLegDown, rLegSide, 0.04f);
 
-        ApplyLimbTPoseDirect(
+        SolveLinearChain4(
             lHip, lKnee, lAnkle, lFoot,
             lLegDir,
-            torsoAt
+            forwardHint
         );
 
-        ApplyLimbTPoseDirect(
+        SolveLinearChain4(
             rHip, rKnee, rAnkle, rFoot,
             rLegDir,
-            torsoAt
+            forwardHint
         );
     }
 
