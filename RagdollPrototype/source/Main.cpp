@@ -1,435 +1,594 @@
-/*
-    Plugin-SDK (Grand Theft Auto) source file
-    Authors: GTA Community. See more here
-    https://github.com/DK22Pac/plugin-sdk
-    Do not delete this comment block. Respect others' work!
-*/
-
-#include <plugin.h>
-#include <CPed.h>
-#include <CPools.h>
-#include <CTimer.h>
-#include <CWorld.h>
-#include <ePedState.h>
-#include <ePedBones.h>
-
-#include <algorithm>
-#include <array>
 #include <cmath>
-#include <vector>
+
+#include "plugin.h"
+#include "common.h"
+#include "Patch.h"
+
+#include "CEntity.h"
+#include "CPed.h"
+#include "CFont.h"
+#include "CSprite.h"
+#include "CRGBA.h"
+#include "CVector.h"
+#include "eEntityType.h"
+#include "ePedBones.h"
+#include "RenderWare.h"
 
 using namespace plugin;
 
-namespace {
-    constexpr float kGravity = 0.020f;
-    constexpr float kVelocityDamping = 0.990f;
-    constexpr float kGroundBounce = 0.15f;
-    constexpr float kGroundFriction = 0.80f;
-    constexpr int   kSolverIterations = 6;
-    constexpr float kNodeCollisionRadius = 0.045f;
-    constexpr bool  kDrawDebugSkeleton = true;
-    constexpr bool  kRestorePedMesh = false; // Root-only sync, not full bone skinning yet.
-    constexpr bool  kInheritPedVelocityOnSpawn = true;
+namespace ragdoll_debug {
 
-    enum RagNodeId {
-        NODE_PELVIS,
-        NODE_SPINE,
-        NODE_NECK,
-        NODE_HEAD,
-        NODE_L_SHOULDER,
-        NODE_L_ELBOW,
-        NODE_L_HAND,
-        NODE_R_SHOULDER,
-        NODE_R_ELBOW,
-        NODE_R_HAND,
-        NODE_L_HIP,
-        NODE_L_KNEE,
-        NODE_L_FOOT,
-        NODE_R_HIP,
-        NODE_R_KNEE,
-        NODE_R_FOOT,
-        NODE_COUNT
+    struct BoneLabel {
+        unsigned int id;
+        const char* name;
     };
 
-    struct Node {
-        CVector pos{};
-        CVector prevPos{};
-        float invMass{};
+    static bool gDrawBones = true;
+    static bool gForceTPose = true;
+
+    static BoneLabel gBoneLabels[] = {
+        { BONE_PELVIS,         "PELVIS" },
+        { BONE_SPINE1,         "SPINE1" },
+        { BONE_UPPERTORSO,     "TORSO"  },
+        { BONE_NECK,           "NECK"   },
+        { BONE_HEAD,           "HEAD"   },
+
+        { BONE_LEFTSHOULDER,   "L SHLDR" },
+        { BONE_LEFTELBOW,      "L ELBOW" },
+        { BONE_LEFTWRIST,      "L WRIST" },
+        { BONE_LEFTHAND,       "L HAND"  },
+
+        { BONE_RIGHTSHOULDER,  "R SHLDR" },
+        { BONE_RIGHTELBOW,     "R ELBOW" },
+        { BONE_RIGHTWRIST,     "R WRIST" },
+        { BONE_RIGHTHAND,      "R HAND"  },
+
+        { BONE_LEFTHIP,        "L HIP"   },
+        { BONE_LEFTKNEE,       "L KNEE"  },
+        { BONE_LEFTANKLE,      "L ANKLE" },
+        { BONE_LEFTFOOT,       "L FOOT"  },
+
+        { BONE_RIGHTHIP,       "R HIP"   },
+        { BONE_RIGHTKNEE,      "R KNEE"  },
+        { BONE_RIGHTANKLE,     "R ANKLE" },
+        { BONE_RIGHTFOOT,      "R FOOT"  }
     };
 
-    struct Edge {
-        unsigned short a{};
-        unsigned short b{};
-        float restLen{};
-        float stiffness{};
-    };
-
-    struct BendConstraint {
-        unsigned short a{};
-        unsigned short b{};
-        unsigned short c{};
-        float minDist{};
-        float maxDist{};
-        float stiffness{};
-    };
-
-    struct BoneSource {
-        unsigned short ragNode{};
-        unsigned short pedBone{};
-    };
-
-    struct PedRagdoll {
-        CPed* ped{};
-        int pedRef{-1};
-        bool active{};
-        std::array<Node, NODE_COUNT> nodes{};
-        std::vector<Edge> edges;
-        std::vector<BendConstraint> bends;
-        CVector rootOffset{};
-        CVector inheritedVelocity{};
-        unsigned int lastTouchedFrame{};
-    };
-
-    constexpr std::array<BoneSource, NODE_COUNT> kBoneMap = {{
-        { NODE_PELVIS, BONE_PELVIS },
-        { NODE_SPINE, BONE_SPINE1 },
-        { NODE_NECK, BONE_NECK },
-        { NODE_HEAD, BONE_HEAD },
-        { NODE_L_SHOULDER, BONE_LEFTSHOULDER },
-        { NODE_L_ELBOW, BONE_LEFTELBOW },
-        { NODE_L_HAND, BONE_LEFTHAND },
-        { NODE_R_SHOULDER, BONE_RIGHTSHOULDER },
-        { NODE_R_ELBOW, BONE_RIGHTELBOW },
-        { NODE_R_HAND, BONE_RIGHTHAND },
-        { NODE_L_HIP, BONE_LEFTHIP },
-        { NODE_L_KNEE, BONE_LEFTKNEE },
-        { NODE_L_FOOT, BONE_LEFTFOOT },
-        { NODE_R_HIP, BONE_RIGHTHIP },
-        { NODE_R_KNEE, BONE_RIGHTKNEE },
-        { NODE_R_FOOT, BONE_RIGHTFOOT }
-    }};
-
-    static std::vector<PedRagdoll> g_ragdolls;
-
-    void AddEdge(std::vector<Edge>& edges, RagNodeId a, RagNodeId b, float restLen, float stiffness) {
-        edges.push_back({ static_cast<unsigned short>(a), static_cast<unsigned short>(b), restLen, stiffness });
+    static float VecDot(const CVector& a, const CVector& b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
     }
 
-    float Distance(const CVector& a, const CVector& b) {
-        const CVector d = b - a;
-        return std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    static CVector VecCross(const CVector& a, const CVector& b) {
+        return CVector(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x
+        );
     }
 
-    void AddBend(std::vector<BendConstraint>& bends, RagNodeId a, RagNodeId b, RagNodeId c, float minAngleDeg, float maxAngleDeg, const std::array<Node, NODE_COUNT>& nodes, float stiffness) {
-        const float l1 = Distance(nodes[a].pos, nodes[b].pos);
-        const float l2 = Distance(nodes[c].pos, nodes[b].pos);
-
-        const float minCos = std::cos(maxAngleDeg * 3.14159265f / 180.0f);
-        const float maxCos = std::cos(minAngleDeg * 3.14159265f / 180.0f);
-        const float minDistSq = std::max(0.0001f, l1 * l1 + l2 * l2 - 2.0f * l1 * l2 * maxCos);
-        const float maxDistSq = std::max(0.0001f, l1 * l1 + l2 * l2 - 2.0f * l1 * l2 * minCos);
-
-        bends.push_back({
-            static_cast<unsigned short>(a),
-            static_cast<unsigned short>(b),
-            static_cast<unsigned short>(c),
-            std::sqrt(std::min(minDistSq, maxDistSq)),
-            std::sqrt(std::max(minDistSq, maxDistSq)),
-            stiffness
-        });
+    static CVector VecAdd(const CVector& a, const CVector& b) {
+        return CVector(a.x + b.x, a.y + b.y, a.z + b.z);
     }
 
-    bool IsDeadEnough(const CPed* ped) {
-        return ped && (ped->m_fHealth <= 0.0f || ped->m_ePedState == PEDSTATE_DIE || ped->m_ePedState == PEDSTATE_DEAD || ped->m_ePedState == PEDSTATE_DIE_BY_STEALTH);
+    static CVector VecSub(const CVector& a, const CVector& b) {
+        return CVector(a.x - b.x, a.y - b.y, a.z - b.z);
     }
 
-    void BuildEdgeRig(PedRagdoll& ragdoll) {
-        auto& n = ragdoll.nodes;
-        auto& e = ragdoll.edges;
-        auto& b = ragdoll.bends;
-        e.clear();
-        b.clear();
-
-        AddEdge(e, NODE_PELVIS, NODE_SPINE, Distance(n[NODE_PELVIS].pos, n[NODE_SPINE].pos), 0.90f);
-        AddEdge(e, NODE_SPINE, NODE_NECK, Distance(n[NODE_SPINE].pos, n[NODE_NECK].pos), 0.90f);
-        AddEdge(e, NODE_NECK, NODE_HEAD, Distance(n[NODE_NECK].pos, n[NODE_HEAD].pos), 0.85f);
-
-        AddEdge(e, NODE_NECK, NODE_L_SHOULDER, Distance(n[NODE_NECK].pos, n[NODE_L_SHOULDER].pos), 0.85f);
-        AddEdge(e, NODE_L_SHOULDER, NODE_L_ELBOW, Distance(n[NODE_L_SHOULDER].pos, n[NODE_L_ELBOW].pos), 0.85f);
-        AddEdge(e, NODE_L_ELBOW, NODE_L_HAND, Distance(n[NODE_L_ELBOW].pos, n[NODE_L_HAND].pos), 0.85f);
-
-        AddEdge(e, NODE_NECK, NODE_R_SHOULDER, Distance(n[NODE_NECK].pos, n[NODE_R_SHOULDER].pos), 0.85f);
-        AddEdge(e, NODE_R_SHOULDER, NODE_R_ELBOW, Distance(n[NODE_R_SHOULDER].pos, n[NODE_R_ELBOW].pos), 0.85f);
-        AddEdge(e, NODE_R_ELBOW, NODE_R_HAND, Distance(n[NODE_R_ELBOW].pos, n[NODE_R_HAND].pos), 0.85f);
-
-        AddEdge(e, NODE_PELVIS, NODE_L_HIP, Distance(n[NODE_PELVIS].pos, n[NODE_L_HIP].pos), 0.92f);
-        AddEdge(e, NODE_L_HIP, NODE_L_KNEE, Distance(n[NODE_L_HIP].pos, n[NODE_L_KNEE].pos), 0.90f);
-        AddEdge(e, NODE_L_KNEE, NODE_L_FOOT, Distance(n[NODE_L_KNEE].pos, n[NODE_L_FOOT].pos), 0.90f);
-
-        AddEdge(e, NODE_PELVIS, NODE_R_HIP, Distance(n[NODE_PELVIS].pos, n[NODE_R_HIP].pos), 0.92f);
-        AddEdge(e, NODE_R_HIP, NODE_R_KNEE, Distance(n[NODE_R_HIP].pos, n[NODE_R_KNEE].pos), 0.90f);
-        AddEdge(e, NODE_R_KNEE, NODE_R_FOOT, Distance(n[NODE_R_KNEE].pos, n[NODE_R_FOOT].pos), 0.90f);
-
-        AddEdge(e, NODE_L_SHOULDER, NODE_R_SHOULDER, Distance(n[NODE_L_SHOULDER].pos, n[NODE_R_SHOULDER].pos), 0.80f);
-        AddEdge(e, NODE_L_HIP, NODE_R_HIP, Distance(n[NODE_L_HIP].pos, n[NODE_R_HIP].pos), 0.80f);
-        AddEdge(e, NODE_L_HAND, NODE_R_HAND, Distance(n[NODE_L_HAND].pos, n[NODE_R_HAND].pos), 0.25f);
-
-        AddBend(b, NODE_L_SHOULDER, NODE_L_ELBOW, NODE_L_HAND, 12.0f, 165.0f, n, 0.45f);
-        AddBend(b, NODE_R_SHOULDER, NODE_R_ELBOW, NODE_R_HAND, 12.0f, 165.0f, n, 0.45f);
-        AddBend(b, NODE_L_HIP, NODE_L_KNEE, NODE_L_FOOT, 6.0f, 170.0f, n, 0.55f);
-        AddBend(b, NODE_R_HIP, NODE_R_KNEE, NODE_R_FOOT, 6.0f, 170.0f, n, 0.55f);
-        AddBend(b, NODE_PELVIS, NODE_SPINE, NODE_NECK, 8.0f, 160.0f, n, 0.35f);
+    static CVector VecScale(const CVector& v, float s) {
+        return CVector(v.x * s, v.y * s, v.z * s);
     }
 
-    bool TryCaptureInitialPose(CPed* ped, PedRagdoll& ragdoll) {
+    static float VecLenSq(const CVector& v) {
+        return v.x * v.x + v.y * v.y + v.z * v.z;
+    }
+
+    static float VecLen(const CVector& v) {
+        return std::sqrt(VecLenSq(v));
+    }
+
+    static CVector SafeNormalise(const CVector& v, const CVector& fallback) {
+        const float lenSq = VecLenSq(v);
+        if (lenSq <= 0.000001f)
+            return fallback;
+
+        const float invLen = 1.0f / std::sqrt(lenSq);
+        return CVector(v.x * invLen, v.y * invLen, v.z * invLen);
+    }
+
+    static float ClampUnit(float x) {
+        if (x < -1.0f) return -1.0f;
+        if (x > 1.0f) return  1.0f;
+        return x;
+    }
+
+    static CVector GetMatrixRight(const RwMatrix* m) {
+        return CVector(m->right.x, m->right.y, m->right.z);
+    }
+
+    static CVector GetMatrixUp(const RwMatrix* m) {
+        return CVector(m->up.x, m->up.y, m->up.z);
+    }
+
+    static CVector GetMatrixAt(const RwMatrix* m) {
+        return CVector(m->at.x, m->at.y, m->at.z);
+    }
+
+    static CVector GetMatrixPos(const RwMatrix* m) {
+        return CVector(m->pos.x, m->pos.y, m->pos.z);
+    }
+
+    static void SetMatrixPos(RwMatrix* m, const CVector& p) {
+        m->pos.x = p.x;
+        m->pos.y = p.y;
+        m->pos.z = p.z;
+    }
+
+    static CVector ProjectOntoPlane(const CVector& v, const CVector& planeNormalRaw) {
+        const CVector n = SafeNormalise(planeNormalRaw, CVector(0.0f, 0.0f, 1.0f));
+        return VecSub(v, VecScale(n, VecDot(v, n)));
+    }
+
+    static CVector RotateVectorAroundAxisRad(const CVector& v, const CVector& axisRaw, float angleRad) {
+        const CVector axis = SafeNormalise(axisRaw, CVector(0.0f, 0.0f, 1.0f));
+        const float c = std::cos(angleRad);
+        const float s = std::sin(angleRad);
+
+        return VecAdd(
+            VecAdd(
+                VecScale(v, c),
+                VecScale(VecCross(axis, v), s)
+            ),
+            VecScale(axis, VecDot(axis, v) * (1.0f - c))
+        );
+    }
+
+    static void RotatePointAroundPivotRad(CVector& point, const CVector& pivot, const CVector& axis, float angleRad) {
+        const CVector rel = VecSub(point, pivot);
+        const CVector rotated = RotateVectorAroundAxisRad(rel, axis, angleRad);
+        point = VecAdd(pivot, rotated);
+    }
+
+    static void RotateMatrixBasisAroundAxisRad(RwMatrix* m, const CVector& axis, float angleRad) {
+        CVector right = GetMatrixRight(m);
+        CVector up = GetMatrixUp(m);
+        CVector at = GetMatrixAt(m);
+
+        right = RotateVectorAroundAxisRad(right, axis, angleRad);
+        up = RotateVectorAroundAxisRad(up, axis, angleRad);
+        at = RotateVectorAroundAxisRad(at, axis, angleRad);
+
+        m->right.x = right.x;
+        m->right.y = right.y;
+        m->right.z = right.z;
+
+        m->up.x = up.x;
+        m->up.y = up.y;
+        m->up.z = up.z;
+
+        m->at.x = at.x;
+        m->at.y = at.y;
+        m->at.z = at.z;
+
+        RwMatrixUpdate(m);
+    }
+
+    static RpHAnimHierarchy* GetSkinHierarchy(RpClump* clump) {
+        if (!clump)
+            return nullptr;
+
+        return GetAnimHierarchyFromSkinClump(clump);
+    }
+
+    static RwMatrix* GetBoneMatrixById(RpHAnimHierarchy* hierarchy, int boneId) {
+        if (!hierarchy)
+            return nullptr;
+
+        const int index = RpHAnimIDGetIndex(hierarchy, boneId);
+        if (index < 0)
+            return nullptr;
+
+        RwMatrix* matrixArray = RpHAnimHierarchyGetMatrixArray(hierarchy);
+        if (!matrixArray)
+            return nullptr;
+
+        return &matrixArray[index];
+    }
+
+    static void RotateLimbChainRigid(
+        RwMatrix* joint,
+        RwMatrix* child,
+        RwMatrix* next,
+        RwMatrix* end,
+        const CVector& axis,
+        float angleRad)
+    {
+        if (!joint || !child || !next || !end)
+            return;
+
+        CVector jointPos = GetMatrixPos(joint);
+        CVector childPos = GetMatrixPos(child);
+        CVector nextPos = GetMatrixPos(next);
+        CVector endPos = GetMatrixPos(end);
+
+        RotateMatrixBasisAroundAxisRad(joint, axis, angleRad);
+        RotateMatrixBasisAroundAxisRad(child, axis, angleRad);
+        RotateMatrixBasisAroundAxisRad(next, axis, angleRad);
+        RotateMatrixBasisAroundAxisRad(end, axis, angleRad);
+
+        RotatePointAroundPivotRad(childPos, jointPos, axis, angleRad);
+        RotatePointAroundPivotRad(nextPos, jointPos, axis, angleRad);
+        RotatePointAroundPivotRad(endPos, jointPos, axis, angleRad);
+
+        SetMatrixPos(joint, jointPos);
+        SetMatrixPos(child, childPos);
+        SetMatrixPos(next, nextPos);
+        SetMatrixPos(end, endPos);
+
+        RwMatrixUpdate(joint);
+        RwMatrixUpdate(child);
+        RwMatrixUpdate(next);
+        RwMatrixUpdate(end);
+    }
+
+    static CVector BuildArmSideTarget(
+        const CVector& torsoPos,
+        const CVector& shoulderPos,
+        const CVector& torsoUp,
+        const CVector& fallbackSide)
+    {
+        CVector raw = VecSub(shoulderPos, torsoPos);
+        raw = ProjectOntoPlane(raw, torsoUp);
+        return SafeNormalise(raw, fallbackSide);
+    }
+
+    static CVector BuildStableLegDown(
+        const CVector& lHipPos,
+        const CVector& lKneePos,
+        const CVector& rHipPos,
+        const CVector& rKneePos,
+        const CVector& fallbackDown)
+    {
+        const CVector lDown = SafeNormalise(VecSub(lKneePos, lHipPos), fallbackDown);
+        const CVector rDown = SafeNormalise(VecSub(rKneePos, rHipPos), fallbackDown);
+        const CVector avg = VecAdd(lDown, rDown);
+
+        if (VecLenSq(avg) <= 0.000001f)
+            return fallbackDown;
+
+        return SafeNormalise(avg, fallbackDown);
+    }
+
+    static CVector BuildLegSideTarget(
+        const CVector& pelvisPos,
+        const CVector& hipPos,
+        const CVector& legDown,
+        const CVector& fallbackSide)
+    {
+        CVector raw = VecSub(hipPos, pelvisPos);
+        raw = ProjectOntoPlane(raw, legDown);
+        return SafeNormalise(raw, fallbackSide);
+    }
+
+    static CVector BuildLegTargetDir(
+        const CVector& legDown,
+        const CVector& legSide,
+        float sideAmount)
+    {
+        CVector target = VecAdd(
+            SafeNormalise(legDown, CVector(0.0f, 0.0f, -1.0f)),
+            VecScale(SafeNormalise(legSide, CVector(1.0f, 0.0f, 0.0f)), sideAmount)
+        );
+
+        return SafeNormalise(target, legDown);
+    }
+
+    static void ApplyLimbTPoseDirect(
+        RwMatrix* joint,
+        RwMatrix* child,
+        RwMatrix* next,
+        RwMatrix* end,
+        const CVector& desiredDirRaw,
+        const CVector& fallbackAxisRaw)
+    {
+        if (!joint || !child || !next || !end)
+            return;
+
+        const CVector jointPos = GetMatrixPos(joint);
+        const CVector childPos = GetMatrixPos(child);
+        const CVector upperVec = VecSub(childPos, jointPos);
+
+        if (VecLenSq(upperVec) <= 0.000001f)
+            return;
+
+        const CVector currentDir = SafeNormalise(upperVec, CVector(0.0f, -1.0f, 0.0f));
+        const CVector desiredDir = SafeNormalise(desiredDirRaw, CVector(0.0f, -1.0f, 0.0f));
+
+        float dot = ClampUnit(VecDot(currentDir, desiredDir));
+        float angleRad = std::acos(dot); // radians
+
+        CVector axis = VecCross(currentDir, desiredDir);
+
+        if (VecLenSq(axis) <= 0.000001f) {
+            axis = fallbackAxisRaw;
+
+            if (dot > 0.9999f)
+                angleRad = 0.0f;
+            else
+                angleRad = 3.14159265358979323846f;
+        }
+
+        axis = SafeNormalise(axis, fallbackAxisRaw);
+
+        RotateLimbChainRigid(joint, child, next, end, axis, angleRad);
+    }
+
+    static void ApplyPlayerTPose(CPed* ped, RpHAnimHierarchy* hierarchy) {
+        if (!ped || !hierarchy)
+            return;
+
+        if (ped != FindPlayerPed())
+            return;
+
+        RwMatrix* torso = GetBoneMatrixById(hierarchy, BONE_UPPERTORSO);
+        RwMatrix* pelvis = GetBoneMatrixById(hierarchy, BONE_PELVIS);
+
+        RwMatrix* lShoulder = GetBoneMatrixById(hierarchy, BONE_LEFTSHOULDER);
+        RwMatrix* lElbow = GetBoneMatrixById(hierarchy, BONE_LEFTELBOW);
+        RwMatrix* lWrist = GetBoneMatrixById(hierarchy, BONE_LEFTWRIST);
+        RwMatrix* lHand = GetBoneMatrixById(hierarchy, BONE_LEFTHAND);
+
+        RwMatrix* rShoulder = GetBoneMatrixById(hierarchy, BONE_RIGHTSHOULDER);
+        RwMatrix* rElbow = GetBoneMatrixById(hierarchy, BONE_RIGHTELBOW);
+        RwMatrix* rWrist = GetBoneMatrixById(hierarchy, BONE_RIGHTWRIST);
+        RwMatrix* rHand = GetBoneMatrixById(hierarchy, BONE_RIGHTHAND);
+
+        RwMatrix* lHip = GetBoneMatrixById(hierarchy, BONE_LEFTHIP);
+        RwMatrix* lKnee = GetBoneMatrixById(hierarchy, BONE_LEFTKNEE);
+        RwMatrix* lAnkle = GetBoneMatrixById(hierarchy, BONE_LEFTANKLE);
+        RwMatrix* lFoot = GetBoneMatrixById(hierarchy, BONE_LEFTFOOT);
+
+        RwMatrix* rHip = GetBoneMatrixById(hierarchy, BONE_RIGHTHIP);
+        RwMatrix* rKnee = GetBoneMatrixById(hierarchy, BONE_RIGHTKNEE);
+        RwMatrix* rAnkle = GetBoneMatrixById(hierarchy, BONE_RIGHTANKLE);
+        RwMatrix* rFoot = GetBoneMatrixById(hierarchy, BONE_RIGHTFOOT);
+
+        if (!torso || !pelvis)
+            return;
+
+        if (!lShoulder || !lElbow || !lWrist || !lHand)
+            return;
+        if (!rShoulder || !rElbow || !rWrist || !rHand)
+            return;
+
+        if (!lHip || !lKnee || !lAnkle || !lFoot)
+            return;
+        if (!rHip || !rKnee || !rAnkle || !rFoot)
+            return;
+
+        const CVector torsoPos = GetMatrixPos(torso);
+        const CVector pelvisPos = GetMatrixPos(pelvis);
+
+        const CVector torsoUp = SafeNormalise(GetMatrixUp(torso), CVector(0.0f, 0.0f, 1.0f));
+        const CVector torsoAt = SafeNormalise(GetMatrixAt(torso), CVector(0.0f, 1.0f, 0.0f));
+
+        // Arms: same working solve as before.
+        const CVector lArmSide = BuildArmSideTarget(
+            torsoPos,
+            GetMatrixPos(lShoulder),
+            torsoUp,
+            CVector(-1.0f, 0.0f, 0.0f)
+        );
+
+        const CVector rArmSide = BuildArmSideTarget(
+            torsoPos,
+            GetMatrixPos(rShoulder),
+            torsoUp,
+            CVector(1.0f, 0.0f, 0.0f)
+        );
+
+        ApplyLimbTPoseDirect(
+            lShoulder, lElbow, lWrist, lHand,
+            lArmSide,
+            torsoAt
+        );
+
+        ApplyLimbTPoseDirect(
+            rShoulder, rElbow, rWrist, rHand,
+            rArmSide,
+            torsoAt
+        );
+
+        // Legs: derive "down" from the current upper-leg directions instead of torso axes.
+        const CVector lHipPos = GetMatrixPos(lHip);
+        const CVector lKneePos = GetMatrixPos(lKnee);
+        const CVector rHipPos = GetMatrixPos(rHip);
+        const CVector rKneePos = GetMatrixPos(rKnee);
+
+        const CVector stableLegDown = BuildStableLegDown(
+            lHipPos, lKneePos,
+            rHipPos, rKneePos,
+            VecScale(torsoUp, -1.0f)
+        );
+
+        const CVector lLegSide = BuildLegSideTarget(
+            pelvisPos,
+            lHipPos,
+            stableLegDown,
+            CVector(-1.0f, 0.0f, 0.0f)
+        );
+
+        const CVector rLegSide = BuildLegSideTarget(
+            pelvisPos,
+            rHipPos,
+            stableLegDown,
+            CVector(1.0f, 0.0f, 0.0f)
+        );
+
+        // Small spread only. Bigger values start turning the legs into a split.
+        const CVector lLegDir = BuildLegTargetDir(stableLegDown, lLegSide, 0.08f);
+        const CVector rLegDir = BuildLegTargetDir(stableLegDown, rLegSide, 0.08f);
+
+        ApplyLimbTPoseDirect(
+            lHip, lKnee, lAnkle, lFoot,
+            lLegDir,
+            torsoAt
+        );
+
+        ApplyLimbTPoseDirect(
+            rHip, rKnee, rAnkle, rFoot,
+            rLegDir,
+            torsoAt
+        );
+    }
+
+    static bool NeedGTAUpdate(CEntity* entity) {
+        if (!entity)
+            return true;
+
+        if (entity->m_nType != ENTITY_TYPE_PED)
+            return true;
+
+        if (!entity->m_pRwClump)
+            return true;
+
+        if (!gForceTPose)
+            return true;
+
+        CPed* ped = reinterpret_cast<CPed*>(entity);
+        if (ped != FindPlayerPed())
+            return true;
+
+        return false;
+    }
+
+    static void RunGameUpdateRpHAnim(CEntity* entity) {
+        if (!entity)
+            return;
+
+        RpClump* clump = entity->m_pRwClump;
+        if (!clump)
+            return;
+
+        RpAtomic* atomic = GetFirstAtomic(clump);
+        if (!atomic)
+            return;
+
+        RpGeometry* geometry = RpAtomicGetGeometry(atomic);
+        if (!geometry)
+            return;
+
+        if (!RpSkinGeometryGetSkin(geometry))
+            return;
+
+        if (entity->bDontUpdateHierarchy)
+            return;
+
+        RpHAnimHierarchy* hierarchy = GetSkinHierarchy(clump);
+        if (!hierarchy)
+            return;
+
+        RpHAnimHierarchyUpdateMatrices(hierarchy);
+    }
+
+    static void RunCustomUpdateRpHAnim(CEntity* entity) {
+        if (!entity)
+            return;
+
+        if (entity->m_nType != ENTITY_TYPE_PED)
+            return;
+
+        RpClump* clump = entity->m_pRwClump;
+        if (!clump)
+            return;
+
+        RpAtomic* atomic = GetFirstAtomic(clump);
+        if (!atomic)
+            return;
+
+        RpGeometry* geometry = RpAtomicGetGeometry(atomic);
+        if (!geometry)
+            return;
+
+        if (!RpSkinGeometryGetSkin(geometry))
+            return;
+
+        if (entity->bDontUpdateHierarchy)
+            return;
+
+        RpHAnimHierarchy* hierarchy = GetSkinHierarchy(clump);
+        if (!hierarchy)
+            return;
+
+        RpHAnimHierarchyUpdateMatrices(hierarchy);
+
+        CPed* ped = reinterpret_cast<CPed*>(entity);
+        ApplyPlayerTPose(ped, hierarchy);
+    }
+
+    static void __fastcall Hooked_UpdateRpHAnim(CEntity* self, int) {
+        if (!self)
+            return;
+
+        if (NeedGTAUpdate(self))
+            RunGameUpdateRpHAnim(self);
+        else
+            RunCustomUpdateRpHAnim(self);
+    }
+
+    static void DrawPedBoneLabels(CPed* ped) {
         if (!ped || !ped->m_pRwClump)
-            return false;
-
-        for (const BoneSource& bone : kBoneMap) {
-            RwV3d p{};
-            ped->GetBonePosition(p, bone.pedBone, true);
-            Node& n = ragdoll.nodes[bone.ragNode];
-            n.pos = { p.x, p.y, p.z };
-            n.prevPos = n.pos;
-            n.invMass = 1.0f;
-        }
-
-        ragdoll.nodes[NODE_HEAD].invMass = 0.8f;
-        ragdoll.nodes[NODE_PELVIS].invMass = 0.6f;
-        ragdoll.nodes[NODE_L_FOOT].invMass = 0.7f;
-        ragdoll.nodes[NODE_R_FOOT].invMass = 0.7f;
-        ragdoll.rootOffset = ped->GetPosition() - ragdoll.nodes[NODE_PELVIS].pos;
-
-        if (kInheritPedVelocityOnSpawn)
-            ragdoll.inheritedVelocity = ped->m_vecMoveSpeed + ped->m_vecLastCollisionImpactVelocity * 0.08f;
-
-        BuildEdgeRig(ragdoll);
-
-        if (kInheritPedVelocityOnSpawn) {
-            for (Node& n : ragdoll.nodes)
-                n.prevPos = n.pos - ragdoll.inheritedVelocity;
-        }
-
-        return true;
-    }
-
-    PedRagdoll* FindRagdoll(CPed* ped) {
-        auto it = std::find_if(g_ragdolls.begin(), g_ragdolls.end(), [ped](const PedRagdoll& r) {
-            return r.ped == ped;
-        });
-        return it != g_ragdolls.end() ? &*it : nullptr;
-    }
-
-    bool SolveGround(Node& n) {
-        bool hit = false;
-        bool gotGround = false;
-        CEntity* ignored{};
-        const float groundZ = CWorld::FindGroundZFor3DCoord(n.pos.x, n.pos.y, n.pos.z + 2.0f, &gotGround, &ignored);
-
-        if (gotGround) {
-            const float floor = groundZ + kNodeCollisionRadius;
-            if (n.pos.z < floor) {
-                n.pos.z = floor;
-
-                CVector vel = (n.pos - n.prevPos);
-                vel.z = -vel.z * kGroundBounce;
-                vel.x *= kGroundFriction;
-                vel.y *= kGroundFriction;
-                n.prevPos = n.pos - vel;
-                hit = true;
-            }
-        }
-
-        return hit;
-    }
-
-    void Simulate(PedRagdoll& ragdoll, float dt) {
-        const float timeScale = std::max(0.5f, std::min(dt, 2.0f));
-
-        for (Node& n : ragdoll.nodes) {
-            CVector vel = (n.pos - n.prevPos) * kVelocityDamping;
-            n.prevPos = n.pos;
-            n.pos += vel;
-            n.pos.z -= kGravity * timeScale;
-        }
-
-        for (int i = 0; i < kSolverIterations; ++i) {
-            for (const Edge& edge : ragdoll.edges) {
-                Node& a = ragdoll.nodes[edge.a];
-                Node& b = ragdoll.nodes[edge.b];
-
-                CVector delta = b.pos - a.pos;
-                const float lenSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-                if (lenSq < 0.000001f)
-                    continue;
-
-                const float len = std::sqrt(lenSq);
-                const float error = (len - edge.restLen) / len;
-                const CVector corr = delta * (0.5f * edge.stiffness * error);
-
-                a.pos += corr;
-                b.pos -= corr;
-            }
-
-            for (const BendConstraint& bend : ragdoll.bends) {
-                Node& a = ragdoll.nodes[bend.a];
-                Node& c = ragdoll.nodes[bend.c];
-
-                CVector delta = c.pos - a.pos;
-                const float lenSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-                if (lenSq < 0.000001f)
-                    continue;
-
-                const float len = std::sqrt(lenSq);
-                float target = len;
-                if (len < bend.minDist)
-                    target = bend.minDist;
-                else if (len > bend.maxDist)
-                    target = bend.maxDist;
-
-                if (target != len) {
-                    const float corrAmount = (target - len) / len;
-                    const CVector corr = delta * (0.5f * bend.stiffness * corrAmount);
-                    a.pos -= corr;
-                    c.pos += corr;
-                }
-            }
-
-            for (Node& n : ragdoll.nodes)
-                SolveGround(n);
-        }
-    }
-
-    void SyncPedMeshToRagdoll(PedRagdoll& ragdoll, CPed* ped) {
-        if (!ped)
             return;
 
-        const CVector rootPos = ragdoll.nodes[NODE_PELVIS].pos + ragdoll.rootOffset;
-        ped->SetPosn(rootPos);
+        for (unsigned int i = 0; i < sizeof(gBoneLabels) / sizeof(gBoneLabels[0]); ++i) {
+            RwV3d boneWorld{};
+            ped->GetBonePosition(boneWorld, gBoneLabels[i].id, true);
 
-        const CVector facingVec = ragdoll.nodes[NODE_NECK].pos - ragdoll.nodes[NODE_PELVIS].pos;
-        const float len2D = std::sqrt(facingVec.x * facingVec.x + facingVec.y * facingVec.y);
-        if (len2D > 0.0001f) {
-            const float heading = std::atan2(-facingVec.x, facingVec.y);
-            ped->SetHeading(heading);
-        }
+            RwV3d screen{};
+            float w = 0.0f;
+            float h = 0.0f;
 
-        ped->bUpdateAnimHeading = false;
-        ped->bUpdateMatricesRequired = true;
-        ped->bDontRender = false;
-        ped->UpdateRwMatrix();
-        ped->UpdateRpHAnim();
-    }
-
-    void RenderRagdollLines(const PedRagdoll& ragdoll) {
-        if (ragdoll.edges.empty())
-            return;
-
-        std::vector<RwIm3DVertex> verts(ragdoll.edges.size() * 2);
-        unsigned int idx = 0;
-
-        for (const Edge& edge : ragdoll.edges) {
-            const CVector& a = ragdoll.nodes[edge.a].pos;
-            const CVector& b = ragdoll.nodes[edge.b].pos;
-
-            RwIm3DVertexSetPos(&verts[idx], a.x, a.y, a.z);
-            RwIm3DVertexSetRGBA(&verts[idx], 220, 220, 255, 255);
-            ++idx;
-
-            RwIm3DVertexSetPos(&verts[idx], b.x, b.y, b.z);
-            RwIm3DVertexSetRGBA(&verts[idx], 220, 220, 255, 255);
-            ++idx;
-        }
-
-        if (RwIm3DTransform(verts.data(), static_cast<unsigned int>(verts.size()), nullptr, rwIM3D_ALLOPAQUE)) {
-            for (unsigned int i = 0; i < verts.size(); i += 2)
-                RwIm3DRenderLine(i, i + 1);
-            RwIm3DEnd();
-        }
-    }
-
-    void TickRagdolls() {
-        CPool<CPed, CCopPed>* pedPool = CPools::ms_pPedPool;
-        if (!pedPool)
-            return;
-
-        for (int i = 0; i < pedPool->m_nSize; ++i) {
-            CPed* ped = pedPool->GetAt(i);
-            if (!ped)
+            if (!CSprite::CalcScreenCoors(boneWorld, &screen, &w, &h, true, true))
                 continue;
 
-            if (!IsDeadEnough(ped))
-                continue;
-
-            PedRagdoll* found = FindRagdoll(ped);
-            if (!found) {
-                PedRagdoll created{};
-                created.ped = ped;
-                created.pedRef = CPools::GetPedRef(ped);
-                created.active = TryCaptureInitialPose(ped, created);
-                created.lastTouchedFrame = CTimer::m_FrameCounter;
-
-                if (created.active)
-                    g_ragdolls.push_back(created);
-            } else {
-                found->lastTouchedFrame = CTimer::m_FrameCounter;
-            }
+            CFont::SetBackground(false, false);
+            CFont::SetScale(0.35f, 0.8f);
+            CFont::SetJustify(false);
+            CFont::SetOrientation(ALIGN_LEFT);
+            CFont::SetProportional(true);
+            CFont::SetFontStyle(FONT_MENU);
+            CFont::SetColor(CRGBA(255, 80, 80, 255));
+            CFont::SetDropColor(CRGBA(0, 0, 0, 255));
+            CFont::SetDropShadowPosition(1);
+            CFont::PrintString(screen.x, screen.y, gBoneLabels[i].name);
         }
-
-        g_ragdolls.erase(std::remove_if(g_ragdolls.begin(), g_ragdolls.end(), [](PedRagdoll& ragdoll) {
-            CPed* ped = CPools::GetPed(ragdoll.pedRef);
-            if (!ped)
-                return true;
-
-            if (CTimer::m_FrameCounter - ragdoll.lastTouchedFrame > 240) {
-                ped->bDontRender = false;
-                return true;
-            }
-
-            const float dt = CTimer::ms_fTimeStep;
-            Simulate(ragdoll, dt);
-
-            if (kRestorePedMesh) {
-                SyncPedMeshToRagdoll(ragdoll, ped);
-                ped->bDontRender = false;
-            } else {
-                ped->bDontRender = true;
-            }
-            return false;
-        }), g_ragdolls.end());
     }
 
-    void DrawRagdolls() {
-        if (!kDrawDebugSkeleton)
-            return;
+    class RagdollPrototype {
+    public:
+        RagdollPrototype() {
+            patch::RedirectJump(0x532B20, Hooked_UpdateRpHAnim);
 
-        RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, reinterpret_cast<void*>(TRUE));
-        RwRenderStateSet(rwRENDERSTATEZTESTENABLE, reinterpret_cast<void*>(TRUE));
+            Events::gameProcessEvent += [] {
+                if (KeyPressed(VK_F5))
+                    gDrawBones = !gDrawBones;
 
-        for (const PedRagdoll& ragdoll : g_ragdolls)
-            RenderRagdollLines(ragdoll);
-    }
-}
+                if (KeyPressed(VK_F6))
+                    gForceTPose = !gForceTPose;
+                };
 
-class InhouseRagdollPlugin {
-public:
-    InhouseRagdollPlugin() {
-        Events::gameProcessEvent += [] {
-            TickRagdolls();
-        };
+            Events::drawingEvent += [] {
+                if (!gDrawBones)
+                    return;
 
-        Events::drawingEvent += [] {
-            DrawRagdolls();
-        };
+                CPed* player = FindPlayerPed();
+                if (!player)
+                    return;
 
-        Events::pedRenderEvent.after += [](CPed* ped) {
-            if (!ped)
-                return;
+                DrawPedBoneLabels(player);
+                };
+        }
+    };
 
-            if (PedRagdoll* ragdoll = FindRagdoll(ped)) {
-                if (ragdoll->active && !kRestorePedMesh)
-                    ped->bDontRender = true;
-            }
-        };
-    }
-} g_inhouseRagdollPlugin;
+    static RagdollPrototype gRagdollPrototype;
+
+} // namespace ragdoll_debug
