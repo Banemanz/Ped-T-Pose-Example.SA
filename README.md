@@ -1,2 +1,1 @@
-# GTA-SA-Ragdoll-TEST
-TEST GTA SA RAGDOLL USING IM3D, NOT GAMEPLAY READY
+T-Pose example for those wishing to implement ragdoll physics. Note, this actually does not fufill that purpose due to not being full manipulation of skeleton, bugs with peds, at best reference for modifying bone positions
